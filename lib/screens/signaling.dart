@@ -1,5 +1,4 @@
-import 'dart:convert';
-
+import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
@@ -13,181 +12,281 @@ class Signaling {
           'stun:stun1.l.google.com:19302',
           'stun:stun2.l.google.com:19302'
         ]
-      }
-    ]
+      },
+      // Add free TURN servers for NAT traversal
+      {
+        'urls': 'turn:openrelay.metered.ca:80',
+        'username': 'openrelayproject',
+        'credential': 'openrelayproject',
+      },
+      {
+        'urls': 'turn:openrelay.metered.ca:443',
+        'username': 'openrelayproject',
+        'credential': 'openrelayproject',
+      },
+      {
+        'urls': 'turn:openrelay.metered.ca:443?transport=tcp',
+        'username': 'openrelayproject',
+        'credential': 'openrelayproject',
+      },
+    ],
+    'sdpSemantics': 'unified-plan',
+    'iceCandidatePoolSize': 10,
+    'iceTransportPolicy': 'all', // Try all connection types
+    'bundlePolicy': 'max-bundle',
+    'rtcpMuxPolicy': 'require',
   };
 
   RTCPeerConnection? peerConnection;
   MediaStream? localStream;
   MediaStream? remoteStream;
   String? roomId;
-  String? currentRoomText;
   StreamStateCallback? onAddRemoteStream;
 
-  Future<String> createRoom(RTCVideoRenderer remoteRenderer) async {
+  // A queue to hold candidates received before connection is ready
+  List<RTCIceCandidate> remoteCandidatesQueue = [];
+
+  // Track if answer has been received (for host)
+  bool _answerReceived = false;
+
+  Future<String> createRoom(String customId, RTCVideoRenderer remoteRenderer) async {
     FirebaseFirestore db = FirebaseFirestore.instance;
-    DocumentReference roomRef = db.collection('rooms').doc();
+    DocumentReference roomRef = db.collection('rooms').doc(customId);
 
-    print('Create PeerConnection with configuration: $configuration');
-
+    print('DEBUG: Creating room: $customId');
     peerConnection = await createPeerConnection(configuration);
 
+    // Register listeners FIRST before adding transceivers
     registerPeerConnectionListeners();
 
+    // Add local tracks FIRST, before creating transceivers
     localStream?.getTracks().forEach((track) {
+      print('DEBUG: Host adding local track: ${track.kind}, enabled: ${track.enabled}');
       peerConnection?.addTrack(track, localStream!);
     });
 
-    // Code for collecting ICE candidates below
+    // Collect ICE candidates
     var callerCandidatesCollection = roomRef.collection('callerCandidates');
-
-    peerConnection?.onIceCandidate = (RTCIceCandidate candidate) {
-      print('Got candidate: ${candidate.toMap()}');
-      callerCandidatesCollection.add(candidate.toMap());
+    peerConnection?.onIceCandidate = (RTCIceCandidate? candidate) {
+      if (candidate != null) {
+        print('DEBUG: Host ICE candidate type: ${candidate.candidate?.contains('typ relay') == true ? 'RELAY (TURN)' : candidate.candidate?.contains('typ srflx') == true ? 'SRFLX (STUN)' : candidate.candidate?.contains('typ host') == true ? 'HOST' : 'UNKNOWN'}');
+        print('DEBUG: Host sending ICE candidate: ${candidate.candidate}');
+        callerCandidatesCollection.add(candidate.toMap());
+      }
     };
-    // Finish Code for collecting ICE candidate
 
-    // Add code for creating a room
-    RTCSessionDescription offer = await peerConnection!.createOffer();
+    // Create Offer with explicit constraints
+    RTCSessionDescription offer = await peerConnection!.createOffer({
+      'offerToReceiveAudio': true,
+      'offerToReceiveVideo': true,
+    });
     await peerConnection!.setLocalDescription(offer);
-    print('Created offer: $offer');
 
-    Map<String, dynamic> roomWithOffer = {'offer': offer.toMap()};
+    print('DEBUG: Local description set. SDP type: ${offer.type}');
 
-    await roomRef.set(roomWithOffer);
-    var roomId = roomRef.id;
-    print('New room created with SDK offer. Room ID: $roomId');
-    currentRoomText = 'Current room is $roomId - You are the caller!';
-    // Created a Room
+    await roomRef.set({'offer': offer.toMap()});
+    print('DEBUG: Offer uploaded to Firestore. Waiting for answer...');
 
-    peerConnection?.onTrack = (RTCTrackEvent event) {
-      print('Got remote track: ${event.streams[0]}');
+    // Store roomId immediately so hangUp can clean up
+    roomId = customId;
 
-      event.streams[0].getTracks().forEach((track) {
-        print('Add a track to the remoteStream $track');
-        remoteStream?.addTrack(track);
-      });
-    };
+    // Reset the answer received flag for this new room
+    _answerReceived = false;
 
-    // Listening for remote session description below
+    // Listen for Answer - FIXED: Use onSnapshot with better filtering
     roomRef.snapshots().listen((snapshot) async {
-      print('Got updated room: ${snapshot.data()}');
+      if (!snapshot.exists || _answerReceived) return;
 
-      Map<String, dynamic> data = snapshot.data() as Map<String, dynamic>;
-      if (peerConnection?.getRemoteDescription() != null &&
-          data['answer'] != null) {
+      var data = snapshot.data() as Map<String, dynamic>?;
+      if (data == null) return;
+
+      print("DEBUG: Host snapshot update received. Keys: ${data.keys.toList()}");
+
+      // Debug the conditions
+      bool hasAnswer = data.containsKey('answer');
+      var remoteDesc = await peerConnection?.getRemoteDescription();
+      bool noRemoteDesc = remoteDesc == null || remoteDesc.sdp == null || remoteDesc.sdp!.isEmpty;
+
+      print("DEBUG: hasAnswer: $hasAnswer, noRemoteDesc: $noRemoteDesc, answerReceived: $_answerReceived");
+
+      // Check if answer exists and we haven't set remote description yet
+      if (data.containsKey('answer') && noRemoteDesc && !_answerReceived) {
+        _answerReceived = true;
+        var answerData = data['answer'] as Map<String, dynamic>;
         var answer = RTCSessionDescription(
-          data['answer']['sdp'],
-          data['answer']['type'],
+          answerData['sdp'],
+          answerData['type'],
         );
+        print("DEBUG: Host received Answer! Setting remote description...");
+        print("DEBUG: Answer SDP type: ${answer.type}");
 
-        print("Someone tried to connect");
-        await peerConnection?.setRemoteDescription(answer);
+        try {
+          await peerConnection?.setRemoteDescription(answer);
+          print("DEBUG: Remote description set successfully!");
+          await _processQueuedCandidates();
+        } catch (e) {
+          print("ERROR: Failed to set remote description: $e");
+          _answerReceived = false; // Allow retry
+        }
       }
     });
-    // Listening for remote session description above
 
-    // Listen for remote Ice candidates below
+    // Listen for Guest Candidates
     roomRef.collection('calleeCandidates').snapshots().listen((snapshot) {
-      snapshot.docChanges.forEach((change) {
+      for (var change in snapshot.docChanges) {
         if (change.type == DocumentChangeType.added) {
-          Map<String, dynamic> data = change.doc.data() as Map<String, dynamic>;
-          print('Got new remote ICE candidate: ${jsonEncode(data)}');
-          peerConnection!.addCandidate(
-            RTCIceCandidate(
-              data['candidate'],
-              data['sdpMid'],
-              data['sdpMLineIndex'],
-            ),
-          );
+          var data = change.doc.data() as Map<String, dynamic>;
+          print('DEBUG: Host received guest candidate');
+          _addCandidateOrQueue(data);
         }
-      });
+      }
     });
-    // Listen for remote ICE candidates above
 
-    return roomId;
+    return customId;
   }
 
-  Future<void> joinRoom(String roomId, RTCVideoRenderer remoteVideo) async {
+  // --- GUEST LOGIC ---
+  Future<void> joinRoom(String inputRoomId, RTCVideoRenderer remoteVideo) async {
     FirebaseFirestore db = FirebaseFirestore.instance;
-    print(roomId);
-    DocumentReference roomRef = db.collection('rooms').doc('$roomId');
+    DocumentReference roomRef = db.collection('rooms').doc(inputRoomId);
     var roomSnapshot = await roomRef.get();
-    print('Got room ${roomSnapshot.exists}');
 
     if (roomSnapshot.exists) {
-      print('Create PeerConnection with configuration: $configuration');
+      print('DEBUG: Guest joining room: $inputRoomId');
       peerConnection = await createPeerConnection(configuration);
 
       registerPeerConnectionListeners();
 
       localStream?.getTracks().forEach((track) {
+        print('DEBUG: Guest adding local track: ${track.kind}, enabled: ${track.enabled}');
         peerConnection?.addTrack(track, localStream!);
       });
-
-      // Code for collecting ICE candidates below
       var calleeCandidatesCollection = roomRef.collection('calleeCandidates');
       peerConnection!.onIceCandidate = (RTCIceCandidate? candidate) {
-        if (candidate == null) {
-          print('onIceCandidate: complete!');
-          return;
+        if (candidate != null) {
+          print('DEBUG: Guest ICE candidate type: ${candidate.candidate?.contains('typ relay') == true ? 'RELAY (TURN)' : candidate.candidate?.contains('typ srflx') == true ? 'SRFLX (STUN)' : candidate.candidate?.contains('typ host') == true ? 'HOST' : 'UNKNOWN'}');
+          print('DEBUG: Guest sending ICE candidate');
+          calleeCandidatesCollection.add(candidate.toMap());
         }
-        print('onIceCandidate: ${candidate.toMap()}');
-        calleeCandidatesCollection.add(candidate.toMap());
-      };
-      // Code for collecting ICE candidate above
-
-      peerConnection?.onTrack = (RTCTrackEvent event) {
-        print('Got remote track: ${event.streams[0]}');
-        event.streams[0].getTracks().forEach((track) {
-          print('Add a track to the remoteStream: $track');
-          remoteStream?.addTrack(track);
-        });
       };
 
-      // Code for creating SDP answer below
       var data = roomSnapshot.data() as Map<String, dynamic>;
-      print('Got offer $data');
       var offer = data['offer'];
+
+      print('DEBUG: Guest received offer, SDP type: ${offer['type']}');
+
+      // Set Host's Offer as remote description
       await peerConnection?.setRemoteDescription(
         RTCSessionDescription(offer['sdp'], offer['type']),
       );
-      var answer = await peerConnection!.createAnswer();
-      print('Created Answer $answer');
+      print('DEBUG: Guest set remote description (offer)');
 
+      // Create Answer with explicit constraints
+      var answer = await peerConnection!.createAnswer({
+        'offerToReceiveAudio': true,
+        'offerToReceiveVideo': true,
+      });
       await peerConnection!.setLocalDescription(answer);
 
-      Map<String, dynamic> roomWithAnswer = {
-        'answer': {'type': answer.type, 'sdp': answer.sdp}
-      };
+      print('DEBUG: Guest created answer, SDP type: ${answer.type}');
 
-      await roomRef.update(roomWithAnswer);
-      // Finished creating SDP answer
+      // Store roomId for cleanup
+      roomId = inputRoomId;
 
-      // Listening for remote ICE candidates below
-      roomRef.collection('callerCandidates').snapshots().listen((snapshot) {
-        snapshot.docChanges.forEach((document) {
-          var data = document.doc.data() as Map<String, dynamic>;
-          print(data);
-          print('Got new remote ICE candidate: $data');
-          peerConnection!.addCandidate(
-            RTCIceCandidate(
-              data['candidate'],
-              data['sdpMid'],
-              data['sdpMLineIndex'],
-            ),
-          );
+      try {
+        await roomRef.update({
+          'answer': {'type': answer.type, 'sdp': answer.sdp}
         });
+        print("DEBUG: Guest uploaded Answer to Firestore successfully");
+
+        // Verify the write
+        var verifySnapshot = await roomRef.get();
+        var verifyData = verifySnapshot.data() as Map<String, dynamic>?;
+        print("DEBUG: Guest verification - Answer exists in Firestore: ${verifyData?.containsKey('answer')}");
+      } catch (e) {
+        print("ERROR: Guest failed to upload answer: $e");
+      }
+
+      await _processQueuedCandidates();
+
+      // Listen for Host Candidates
+      roomRef.collection('callerCandidates').snapshots().listen((snapshot) {
+        for (var document in snapshot.docChanges) {
+          if (document.type == DocumentChangeType.added) {
+            var data = document.doc.data() as Map<String, dynamic>;
+            print('DEBUG: Guest received host candidate');
+            _addCandidateOrQueue(data);
+          }
+        }
       });
+    } else {
+      print("ERROR: Room does not exist!");
     }
   }
 
-  Future<void> openUserMedia(
-      RTCVideoRenderer localVideo,
-      RTCVideoRenderer remoteVideo,
-      ) async {
-    var stream = await navigator.mediaDevices
-        .getUserMedia({'video': true, 'audio': false});
+  // --- HELPER FUNCTIONS ---
+
+  void _addCandidateOrQueue(Map<String, dynamic> data) async {
+    try {
+      var candidate = RTCIceCandidate(
+        data['candidate'],
+        data['sdpMid'],
+        data['sdpMLineIndex'],
+      );
+
+      // Log candidate type
+      String candidateType = 'UNKNOWN';
+      if (data['candidate']?.contains('typ relay') == true) {
+        candidateType = 'RELAY (TURN)';
+      } else if (data['candidate']?.contains('typ srflx') == true) {
+        candidateType = 'SRFLX (STUN)';
+      } else if (data['candidate']?.contains('typ host') == true) {
+        candidateType = 'HOST';
+      }
+      print("DEBUG: Received remote candidate type: $candidateType");
+
+      // IMPORTANT: Wait until we have a remote description before adding candidates
+      if (peerConnection?.getRemoteDescription() != null) {
+        await peerConnection?.addCandidate(candidate);
+        print("DEBUG: Added Remote Candidate immediately ($candidateType).");
+      } else {
+        remoteCandidatesQueue.add(candidate);
+        print("DEBUG: Queued Remote Candidate ($candidateType). Queue size: ${remoteCandidatesQueue.length}");
+      }
+    } catch (e) {
+      print("ERROR: Failed to add candidate: $e");
+    }
+  }
+
+  Future<void> _processQueuedCandidates() async {
+    if (remoteCandidatesQueue.isEmpty) {
+      print("DEBUG: No queued candidates to process");
+      return;
+    }
+    print("DEBUG: Processing ${remoteCandidatesQueue.length} queued candidates...");
+    for (var candidate in remoteCandidatesQueue) {
+      await peerConnection?.addCandidate(candidate);
+      print("DEBUG: Processed queued candidate");
+    }
+    remoteCandidatesQueue.clear();
+    print("DEBUG: Finished processing queued candidates");
+  }
+
+  Future<void> openUserMedia(RTCVideoRenderer localVideo, RTCVideoRenderer remoteVideo) async {
+    var stream = await navigator.mediaDevices.getUserMedia({
+      'video': {
+        'mandatory': {
+          'minWidth': '640',
+          'minHeight': '480',
+          'minFrameRate': '30',
+        },
+        'facingMode': 'user',
+        'optional': [],
+      },
+      'audio': true,
+    });
+
+    print('DEBUG: Got user media - Video tracks: ${stream.getVideoTracks().length}, Audio tracks: ${stream.getAudioTracks().length}');
 
     localVideo.srcObject = stream;
     localStream = stream;
@@ -196,53 +295,163 @@ class Signaling {
   }
 
   Future<void> hangUp(RTCVideoRenderer localVideo) async {
-    List<MediaStreamTrack> tracks = localVideo.srcObject!.getTracks();
-    tracks.forEach((track) {
-      track.stop();
-    });
+    try {
+      print('DEBUG: Hanging up...');
 
-    if (remoteStream != null) {
-      remoteStream!.getTracks().forEach((track) => track.stop());
+      // Stop all tracks
+      localStream?.getTracks().forEach((track) {
+        print('DEBUG: Stopping local track: ${track.kind}');
+        track.stop();
+      });
+      remoteStream?.getTracks().forEach((track) {
+        print('DEBUG: Stopping remote track: ${track.kind}');
+        track.stop();
+      });
+
+      // Close peer connection
+      if (peerConnection != null) {
+        await peerConnection!.close();
+        peerConnection = null;
+        print('DEBUG: Peer connection closed');
+      }
+
+      // Clean up Firestore
+      if (roomId != null) {
+        var db = FirebaseFirestore.instance;
+        var roomRef = db.collection('rooms').doc(roomId);
+
+        var calleeCandidates = await roomRef.collection('calleeCandidates').get();
+        for (var doc in calleeCandidates.docs) await doc.reference.delete();
+
+        var callerCandidates = await roomRef.collection('callerCandidates').get();
+        for (var doc in callerCandidates.docs) await doc.reference.delete();
+
+        await roomRef.delete();
+        print('DEBUG: Firestore room cleaned up');
+      }
+    } catch (e) {
+      print("ERROR: Error hanging up: $e");
+    } finally {
+      localStream = null;
+      remoteStream = null;
+      roomId = null;
+      remoteCandidatesQueue.clear();
+      _answerReceived = false;
+      print('DEBUG: Hangup complete');
     }
-    if (peerConnection != null) peerConnection!.close();
-
-    if (roomId != null) {
-      var db = FirebaseFirestore.instance;
-      var roomRef = db.collection('rooms').doc(roomId);
-      var calleeCandidates = await roomRef.collection('calleeCandidates').get();
-      calleeCandidates.docs.forEach((document) => document.reference.delete());
-
-      var callerCandidates = await roomRef.collection('callerCandidates').get();
-      callerCandidates.docs.forEach((document) => document.reference.delete());
-
-      await roomRef.delete();
-    }
-
-    localStream!.dispose();
-    remoteStream?.dispose();
   }
 
   void registerPeerConnectionListeners() {
     peerConnection?.onIceGatheringState = (RTCIceGatheringState state) {
-      print('ICE gathering state changed: $state');
+      print('DEBUG: ICE gathering state changed: $state');
     };
 
     peerConnection?.onConnectionState = (RTCPeerConnectionState state) {
-      print('Connection state change: $state');
+      print('DEBUG: Connection state change: $state');
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+        print('ERROR: Connection FAILED!');
+      }
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        print('SUCCESS: Connection ESTABLISHED!');
+      }
     };
 
     peerConnection?.onSignalingState = (RTCSignalingState state) {
-      print('Signaling state change: $state');
+      print('DEBUG: Signaling state change: $state');
     };
 
-    peerConnection?.onIceGatheringState = (RTCIceGatheringState state) {
-      print('ICE connection state change: $state');
+    peerConnection?.onIceConnectionState = (RTCIceConnectionState state) {
+      print('DEBUG: ICE connection state: $state');
+      if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+        print('ERROR: ICE connection FAILED!');
+      }
+      if (state == RTCIceConnectionState.RTCIceConnectionStateConnected) {
+        print('SUCCESS: ICE connection ESTABLISHED!');
+      }
     };
 
-    peerConnection?.onAddStream = (MediaStream stream) {
-      print("Add remote stream");
-      onAddRemoteStream?.call(stream);
-      remoteStream = stream;
+    peerConnection?.onTrack = (RTCTrackEvent event) {
+      print('DEBUG: ===== TRACK RECEIVED =====');
+      print('DEBUG: Track kind: ${event.track.kind}');
+      print('DEBUG: Track ID: ${event.track.id}');
+      print('DEBUG: Track enabled: ${event.track.enabled}');
+      print('DEBUG: Track muted: ${event.track.muted}');
+      print('DEBUG: Number of streams: ${event.streams.length}');
+
+      if (event.streams.isNotEmpty) {
+        print('DEBUG: Stream ID: ${event.streams[0].id}');
+        print('DEBUG: Stream active: ${event.streams[0].active}');
+        print('DEBUG: Stream has ${event.streams[0].getVideoTracks().length} video tracks');
+        print('DEBUG: Stream has ${event.streams[0].getAudioTracks().length} audio tracks');
+
+        // Check if video tracks are enabled
+        for (var track in event.streams[0].getVideoTracks()) {
+          print('DEBUG: Video track ${track.id} - enabled: ${track.enabled}, muted: ${track.muted}');
+        }
+
+        // Check if audio tracks are enabled
+        for (var track in event.streams[0].getAudioTracks()) {
+          print('DEBUG: Audio track ${track.id} - enabled: ${track.enabled}, muted: ${track.muted}');
+        }
+
+        remoteStream = event.streams[0];
+
+        // CRITICAL: Call the callback to update the UI
+        if (onAddRemoteStream != null) {
+          print('DEBUG: Calling onAddRemoteStream callback');
+          onAddRemoteStream?.call(remoteStream!);
+        } else {
+          print('WARNING: onAddRemoteStream callback is NULL!');
+        }
+      } else {
+        print('WARNING: Track event has no streams!');
+      }
     };
+  }
+
+  // Diagnostic method to check connection details
+  Future<void> logConnectionDetails() async {
+    if (peerConnection == null) {
+      print('DEBUG: No peer connection exists');
+      return;
+    }
+
+    print('DEBUG: ===== CONNECTION DETAILS =====');
+    print('DEBUG: Connection state: ${peerConnection?.connectionState}');
+    print('DEBUG: ICE connection state: ${peerConnection?.iceConnectionState}');
+    print('DEBUG: ICE gathering state: ${peerConnection?.iceGatheringState}');
+    print('DEBUG: Signaling state: ${peerConnection?.signalingState}');
+
+    var senders = await peerConnection?.getSenders() ?? [];
+    print('DEBUG: Number of senders: ${senders.length}');
+    for (var sender in senders) {
+      var track = sender.track;
+      if (track != null) {
+        print('DEBUG: Sender - kind: ${track.kind}, enabled: ${track.enabled}, id: ${track.id}');
+      } else {
+        print('DEBUG: Sender has no track');
+      }
+    }
+
+    var receivers = await peerConnection?.getReceivers() ?? [];
+    print('DEBUG: Number of receivers: ${receivers.length}');
+    for (var receiver in receivers) {
+      var track = receiver.track;
+      if (track != null) {
+        print('DEBUG: Receiver - kind: ${track.kind}, enabled: ${track.enabled}, id: ${track.id}');
+      } else {
+        print('DEBUG: Receiver has no track');
+      }
+    }
+
+    var transceivers = await peerConnection?.getTransceivers() ?? [];
+    print('DEBUG: Number of transceivers: ${transceivers.length}');
+
+    var localDesc = await peerConnection?.getLocalDescription();
+    var remoteDesc = await peerConnection?.getRemoteDescription();
+    print('DEBUG: Has local description: ${localDesc != null}');
+    print('DEBUG: Has remote description: ${remoteDesc != null}');
+
+    print('DEBUG: ===== END DETAILS =====');
   }
 }
