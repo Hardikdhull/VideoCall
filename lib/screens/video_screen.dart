@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
-import '../screens/signaling.dart';
+import '../screens/signaling.dart'; // Ensure this path is correct
+import '../widgets/chat_panel.dart'; // Import the new ChatPanel widget
 
 class VideoCallScreen extends StatefulWidget {
   const VideoCallScreen({super.key});
@@ -13,79 +14,64 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   final Signaling signaling = Signaling();
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
+
+  // UI State Variables
   String? roomId;
   TextEditingController textEditingController = TextEditingController();
   bool _inCall = false;
   bool _micEnabled = true;
   bool _camEnabled = true;
   bool _isLoading = false;
-  bool _remoteVideoActive = false; // Track if remote video is actually showing
+  bool _remoteVideoActive = false;
+
+  // New Feature States
+  bool _isChatOpen = false;
+  bool _isScreenSharing = false;
 
   @override
   void initState() {
     super.initState();
     _initializeRenderers();
 
-    // CRITICAL: Set the callback BEFORE any room operations
+    // Set up the listener for when the other person joins/sends video
     signaling.onAddRemoteStream = ((stream) {
       print('UI: Received remote stream callback');
-      print('UI: Stream has ${stream.getVideoTracks().length} video tracks');
-      print('UI: Stream has ${stream.getAudioTracks().length} audio tracks');
-
       setState(() {
         _remoteRenderer.srcObject = stream;
         _remoteVideoActive = true;
       });
-
-      print('UI: Remote renderer srcObject updated');
     });
   }
 
   Future<void> _initializeRenderers() async {
     await _localRenderer.initialize();
     await _remoteRenderer.initialize();
-    print('UI: Renderers initialized');
 
-    // Auto-start camera
     try {
+      // Start camera for the "Green Room" preview
       await signaling.openUserMedia(_localRenderer, _remoteRenderer);
       setState(() {});
-      print('UI: User media opened successfully');
     } catch (e) {
       print("ERROR: Error opening user media: $e");
     }
   }
 
-  // --- FIXED TOGGLE LOGIC ---
+  // --- TOGGLES ---
   void _toggleMic() {
     var tracks = signaling.localStream?.getAudioTracks();
-
     if (tracks != null && tracks.isNotEmpty) {
       bool newStatus = !tracks[0].enabled;
       tracks[0].enabled = newStatus;
-
-      setState(() {
-        _micEnabled = newStatus;
-      });
-      print("UI: Mic enabled: $newStatus");
-    } else {
-      print("ERROR: No audio tracks found to toggle.");
+      setState(() => _micEnabled = newStatus);
     }
   }
 
   void _toggleCam() {
     var tracks = signaling.localStream?.getVideoTracks();
-
     if (tracks != null && tracks.isNotEmpty) {
       bool newStatus = !tracks[0].enabled;
       tracks[0].enabled = newStatus;
-
-      setState(() {
-        _camEnabled = newStatus;
-      });
-      print("UI: Camera enabled: $newStatus");
-    } else {
-      print("ERROR: No video tracks found to toggle.");
+      setState(() => _camEnabled = newStatus);
     }
   }
 
@@ -100,6 +86,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFF202124), // Dark background like Meet
       appBar: _inCall
           ? null
           : AppBar(
@@ -112,6 +99,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     );
   }
 
+  // --- 1. GREEN ROOM (Before Joining) ---
   Widget _buildGreenRoomUI() {
     return Column(
       children: [
@@ -122,22 +110,22 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
               borderRadius: BorderRadius.circular(20),
               child: Stack(
                 children: [
+                  // Local Camera Preview
                   Positioned.fill(
                     child: Container(
                       color: Colors.black,
                       child: RTCVideoView(_localRenderer, mirror: true),
                     ),
                   ),
+                  // Icons overlay
                   Positioned(
                     bottom: 16,
                     left: 16,
                     child: Row(
                       children: [
-                        Icon(_micEnabled ? Icons.mic : Icons.mic_off,
-                            color: Colors.white),
+                        Icon(_micEnabled ? Icons.mic : Icons.mic_off, color: Colors.white),
                         const SizedBox(width: 8),
-                        Icon(_camEnabled ? Icons.videocam : Icons.videocam_off,
-                            color: Colors.white),
+                        Icon(_camEnabled ? Icons.videocam : Icons.videocam_off, color: Colors.white),
                       ],
                     ),
                   )
@@ -146,6 +134,8 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
             ),
           ),
         ),
+
+        // Control Panel
         Container(
           padding: const EdgeInsets.all(24),
           decoration: const BoxDecoration(
@@ -155,92 +145,59 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              if (roomId != null)
-                Container(
-                  padding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  decoration: BoxDecoration(
-                      color: Colors.blue.withOpacity(0.2),
-                      borderRadius: BorderRadius.circular(8)),
-                  child: SelectableText(
-                    "Room ID: $roomId",
-                    style: const TextStyle(
-                        color: Colors.blueAccent, fontWeight: FontWeight.bold),
+              // Create Room Button
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  icon: _isLoading
+                      ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black))
+                      : const Icon(Icons.video_call),
+                  label: Text(_isLoading ? "Creating..." : "New Meeting"),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF8AB4F8),
+                    foregroundColor: Colors.black,
+                    padding: const EdgeInsets.symmetric(vertical: 16),
                   ),
+                  onPressed: _isLoading ? null : () async {
+                    setState(() => _isLoading = true);
+                    try {
+                      String randomCode = (1000 + (DateTime.now().millisecondsSinceEpoch % 9000)).toString();
+                      await signaling.createRoom(randomCode, _remoteRenderer);
+
+                      setState(() {
+                        roomId = randomCode;
+                        _inCall = true;
+                        _remoteVideoActive = false;
+                        textEditingController.text = randomCode;
+                      });
+                    } catch (e) {
+                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e")));
+                    } finally {
+                      setState(() => _isLoading = false);
+                    }
+                  },
                 ),
-              const SizedBox(height: 16),
-
-              // CREATE ROOM BUTTON
-              Row(
-                children: [
-                  Expanded(
-                    child: ElevatedButton.icon(
-                      icon: _isLoading
-                          ? const SizedBox(
-                          width: 24,
-                          height: 24,
-                          child: CircularProgressIndicator(
-                              color: Colors.black, strokeWidth: 2))
-                          : const Icon(Icons.add),
-                      label: Text(_isLoading ? "Creating..." : "Create (Random)"),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF8AB4F8),
-                        foregroundColor: Colors.black,
-                        padding: const EdgeInsets.symmetric(vertical: 16),
-                      ),
-                      onPressed: _isLoading
-                          ? null
-                          : () async {
-                        setState(() => _isLoading = true);
-                        try {
-                          // GENERATE RANDOM 4-DIGIT CODE
-                          String randomCode = (1000 +
-                              (DateTime.now().millisecondsSinceEpoch %
-                                  9000))
-                              .toString();
-
-                          print('UI: Creating room with code: $randomCode');
-
-                          // Use the random code as the ID
-                          roomId = await signaling.createRoom(
-                              randomCode, _remoteRenderer);
-
-                          textEditingController.text = roomId!;
-                          setState(() {
-                            _inCall = true;
-                            _remoteVideoActive = false; // Reset remote video status
-                          });
-                          print('UI: Room created, entered call state');
-                        } catch (e) {
-                          print("ERROR: Failed to create room: $e");
-                          ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(content: Text("Error: $e")));
-                        } finally {
-                          setState(() => _isLoading = false);
-                        }
-                      },
-                    ),
-                  ),
-                ],
               ),
               const SizedBox(height: 16),
 
-              // JOIN ROOM ROW
+              const Text("OR", style: TextStyle(color: Colors.grey)),
+              const SizedBox(height: 16),
+
+              // Join Room Section
               Row(
                 children: [
                   Expanded(
                     child: TextField(
                       controller: textEditingController,
                       keyboardType: TextInputType.number,
+                      style: const TextStyle(color: Colors.white),
                       decoration: InputDecoration(
-                        hintText: "Enter 4-digit code",
-                        prefixIcon: const Icon(Icons.dialpad),
+                        hintText: "Enter a code",
+                        hintStyle: const TextStyle(color: Colors.grey),
+                        prefixIcon: const Icon(Icons.keyboard, color: Colors.grey),
                         filled: true,
                         fillColor: const Color(0xFF3C4043),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(8),
-                          borderSide: BorderSide.none,
-                        ),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
                       ),
                     ),
                   ),
@@ -248,32 +205,30 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                   ElevatedButton(
                     onPressed: () async {
                       if (textEditingController.text.isEmpty) return;
+                      setState(() => _isLoading = true);
 
-                      print('UI: Joining room: ${textEditingController.text.trim()}');
-
-                      // Join using the typed code
-                      await signaling.joinRoom(
-                        textEditingController.text.trim(),
-                        _remoteRenderer,
-                      );
-
-                      setState(() {
-                        roomId = textEditingController.text.trim();
-                        _inCall = true;
-                        _remoteVideoActive = false; // Will be set to true when stream arrives
-                      });
-
-                      print('UI: Joined room, entered call state');
+                      try {
+                        await signaling.joinRoom(textEditingController.text.trim(), _remoteRenderer);
+                        setState(() {
+                          roomId = textEditingController.text.trim();
+                          _inCall = true;
+                          _remoteVideoActive = false;
+                        });
+                      } catch (e) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e")));
+                      } finally {
+                        setState(() => _isLoading = false);
+                      }
                     },
                     style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(
-                          vertical: 16, horizontal: 24),
+                      backgroundColor: Colors.white,
+                      foregroundColor: Colors.black,
+                      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 24),
                     ),
                     child: const Text("Join"),
                   ),
                 ],
               ),
-              const SizedBox(height: 16),
             ],
           ),
         ),
@@ -281,119 +236,113 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     );
   }
 
+  // --- 2. IN-CALL UI (The Video Screen) ---
   Widget _buildInCallUI() {
     return Stack(
       children: [
-        // 1. Remote Video (Fills Screen)
+        // A. REMOTE VIDEO LAYER (Full Screen)
         Positioned.fill(
           child: Container(
             color: Colors.black87,
             child: Stack(
               children: [
-                // A. Placeholder text (Shows if video is missing/loading)
+                // Placeholder
                 Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      const CircularProgressIndicator(color: Colors.white),
+                      if (!_remoteVideoActive) const CircularProgressIndicator(color: Colors.white),
                       const SizedBox(height: 16),
                       Text(
-                        _remoteVideoActive
-                            ? "Connected"
-                            : "Waiting for Remote Video...",
-                        style: const TextStyle(color: Colors.grey, fontSize: 16),
+                        _remoteVideoActive ? "" : "Waiting for Remote Video...",
+                        style: const TextStyle(color: Colors.grey),
                       ),
                     ],
                   ),
                 ),
-                // B. The Actual Remote Video
+                // Actual Video
                 RTCVideoView(
                   _remoteRenderer,
                   objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-                  mirror: false, // Don't mirror remote video
+                  mirror: false,
                 ),
               ],
             ),
           ),
         ),
 
-        // 2. Local Video (Floating PiP)
+        // B. LOCAL VIDEO LAYER (Picture-in-Picture)
         Positioned(
           right: 16,
-          bottom: 100, // Above the control bar
-          child: Container(
-            height: 150,
-            width: 100,
-            decoration: BoxDecoration(
-              color: Colors.black,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.grey.shade800),
-              boxShadow: [
-                BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)
-              ],
-            ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(12),
-              child: Stack(
-                children: [
-                  // Placeholder for self (if camera fails)
-                  const Center(
-                      child: Icon(Icons.videocam_off, color: Colors.grey)),
-                  // The Actual Local Video
-                  RTCVideoView(_localRenderer, mirror: true),
-                ],
+          bottom: 100,
+          child: GestureDetector(
+            onDoubleTap: () {
+              // Optional: Logic to flip camera could go here
+            },
+            child: Container(
+              height: 150,
+              width: 100,
+              decoration: BoxDecoration(
+                color: Colors.black,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.grey.shade800),
+                boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: RTCVideoView(_localRenderer, mirror: !_isScreenSharing), // Don't mirror if sharing screen
               ),
             ),
           ),
         ),
 
-        // 3. Room ID Overlay (Top Center)
+        // C. CHAT PANEL OVERLAY
+        if (_isChatOpen && roomId != null)
+          Positioned(
+            right: 16,
+            bottom: 110, // Above control bar
+            top: 60,     // Below header
+            child: ChatPanel(
+              roomId: roomId!,
+              senderId: signaling.userId,
+              onClose: () => setState(() => _isChatOpen = false),
+            ),
+          ),
+
+        // D. ROOM ID HEADER
         Positioned(
           top: 50,
           left: 20,
-          right: 20,
-          child: Center(
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.6),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  SelectableText(
-                    "Room ID: ${roomId ?? 'Connecting...'}",
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 16,
-                    ),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.black54,
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Row(
+              children: [
+                Text("Room: ${roomId ?? '...'}", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                const SizedBox(width: 8),
+                Container(
+                  width: 8, height: 8,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: _remoteVideoActive ? Colors.green : Colors.orange,
                   ),
-                  const SizedBox(width: 8),
-                  // Connection status indicator
-                  Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: _remoteVideoActive ? Colors.green : Colors.orange,
-                    ),
-                  ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
         ),
 
-        // 4. Control Bar (Bottom Center)
+        // E. BOTTOM CONTROL BAR
         Positioned(
           left: 0,
           right: 0,
-          bottom: 24,
+          bottom: 20,
           child: Center(
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
               decoration: BoxDecoration(
                 color: const Color(0xFF3C4043),
                 borderRadius: BorderRadius.circular(50),
@@ -401,73 +350,72 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // Mic Button
+                  // 1. Mic
                   _buildControlBtn(
                     icon: _micEnabled ? Icons.mic : Icons.mic_off,
-                    color: _micEnabled ? Colors.white : Colors.red,
+                    color: _micEnabled ? Colors.white : Colors.black,
+                    bgColor: _micEnabled ? Colors.transparent : Colors.white,
                     onPressed: _toggleMic,
                   ),
-                  const SizedBox(width: 16),
+                  const SizedBox(width: 12),
 
-                  // Camera Button
+                  // 2. Camera
                   _buildControlBtn(
                     icon: _camEnabled ? Icons.videocam : Icons.videocam_off,
-                    color: _camEnabled ? Colors.white : Colors.red,
+                    color: _camEnabled ? Colors.white : Colors.black,
+                    bgColor: _camEnabled ? Colors.transparent : Colors.white,
                     onPressed: _toggleCam,
                   ),
-                  const SizedBox(width: 16),
+                  const SizedBox(width: 12),
 
-                  // Debug Button (Temporary - for diagnostics)
+                  // 3. Screen Share
                   _buildControlBtn(
-                    icon: Icons.bug_report,
-                    color: Colors.white,
-                    bgColor: Colors.purple,
+                    icon: _isScreenSharing ? Icons.stop_screen_share : Icons.screen_share,
+                    color: _isScreenSharing ? Colors.black : Colors.white,
+                    bgColor: _isScreenSharing ? Colors.greenAccent : Colors.transparent,
                     onPressed: () async {
-                      print('UI: Running diagnostics...');
-                      await signaling.logConnectionDetails();
+                      bool newStatus = !_isScreenSharing;
+                      await signaling.switchScreenShare(newStatus);
+                      setState(() {
+                        _isScreenSharing = newStatus;
+                        // Force update local view to show screen or camera
+                        _localRenderer.srcObject = signaling.localStream;
+                      });
                     },
                   ),
-                  const SizedBox(width: 16),
+                  const SizedBox(width: 12),
 
-                  // Hang Up Button
+                  // 4. Chat
+                  _buildControlBtn(
+                    icon: _isChatOpen ? Icons.chat_bubble : Icons.chat_bubble_outline,
+                    color: _isChatOpen ? Colors.blueAccent : Colors.white,
+                    bgColor: Colors.transparent,
+                    onPressed: () => setState(() => _isChatOpen = !_isChatOpen),
+                  ),
+                  const SizedBox(width: 12),
+
+                  // 5. Hang Up
                   _buildControlBtn(
                     icon: Icons.call_end,
                     color: Colors.white,
                     bgColor: Colors.red,
                     onPressed: () async {
-                      print('UI: Hang up button pressed');
-
-                      // 1. Hang up the call
                       await signaling.hangUp(_localRenderer);
-
-                      // 2. Clear the UI state
                       setState(() {
                         _inCall = false;
                         roomId = null;
                         _remoteVideoActive = false;
-                        // Wipe the renderers to prevent "frozen" frames
+                        _isScreenSharing = false;
+                        _isChatOpen = false;
                         _localRenderer.srcObject = null;
                         _remoteRenderer.srcObject = null;
                       });
 
-                      print('UI: Call ended, returning to green room');
-
-                      // 3. RESTART CAMERA for the Green Room
+                      // Restart Camera for Green Room
                       if (mounted) {
-                        // Small delay to ensure previous tracks are fully dead
                         await Future.delayed(const Duration(milliseconds: 500));
-                        print("UI: Restarting camera for waiting room...");
-
-                        // Re-initialize the local stream
-                        try {
-                          await signaling.openUserMedia(
-                              _localRenderer, _remoteRenderer);
-                          // Force UI refresh
-                          setState(() {});
-                          print('UI: Camera restarted successfully');
-                        } catch (e) {
-                          print('ERROR: Failed to restart camera: $e');
-                        }
+                        await signaling.openUserMedia(_localRenderer, _remoteRenderer);
+                        setState(() {});
                       }
                     },
                   ),
@@ -484,17 +432,17 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
     required IconData icon,
     required Color color,
     required VoidCallback onPressed,
-    Color bgColor = const Color(0xFF3C4043), // Default Google Meet dark grey
+    Color bgColor = Colors.transparent,
   }) {
     return Material(
       color: bgColor,
       shape: const CircleBorder(),
-      clipBehavior: Clip.hardEdge, // Constraints the ripple to the circle
+      clipBehavior: Clip.hardEdge,
       child: InkWell(
         onTap: onPressed,
         child: Container(
-          padding: const EdgeInsets.all(15),
-          child: Icon(icon, color: color, size: 28),
+          padding: const EdgeInsets.all(12),
+          child: Icon(icon, color: color, size: 24),
         ),
       ),
     );
