@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
-import '../screens/signaling.dart'; // Ensure this path is correct
-import '../widgets/chat_panel.dart'; // Import the new ChatPanel widget
+import '../screens/signaling.dart';
+import '../widgets/chat_panel.dart';
 
 class VideoCallScreen extends StatefulWidget {
   const VideoCallScreen({super.key});
@@ -24,9 +24,10 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
   bool _isLoading = false;
   bool _remoteVideoActive = false;
 
-  // New Feature States
-  bool _isChatOpen = false;
-  bool _isScreenSharing = false;
+  // Feature States
+  bool _isChatOpen = false;      // Human Chat
+  bool _isAiChatOpen = false;    // AI Chat (New)
+  bool _isScreenSharing = false; // Screen Share
 
   @override
   void initState() {
@@ -246,7 +247,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
             color: Colors.black87,
             child: Stack(
               children: [
-                // Placeholder
                 Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
@@ -260,7 +260,6 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                     ],
                   ),
                 ),
-                // Actual Video
                 RTCVideoView(
                   _remoteRenderer,
                   objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
@@ -275,28 +274,23 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
         Positioned(
           right: 16,
           bottom: 100,
-          child: GestureDetector(
-            onDoubleTap: () {
-              // Optional: Logic to flip camera could go here
-            },
-            child: Container(
-              height: 150,
-              width: 100,
-              decoration: BoxDecoration(
-                color: Colors.black,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.grey.shade800),
-                boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)],
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: RTCVideoView(_localRenderer, mirror: !_isScreenSharing), // Don't mirror if sharing screen
-              ),
+          child: Container(
+            height: 150,
+            width: 100,
+            decoration: BoxDecoration(
+              color: Colors.black,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.grey.shade800),
+              boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 10)],
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: RTCVideoView(_localRenderer, mirror: !_isScreenSharing),
             ),
           ),
         ),
 
-        // C. CHAT PANEL OVERLAY
+        // C. HUMAN CHAT PANEL OVERLAY (Right Side)
         if (_isChatOpen && roomId != null)
           Positioned(
             right: 16,
@@ -309,7 +303,10 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
             ),
           ),
 
-        // D. ROOM ID HEADER
+        // D. NEW: AI CHAT PANEL OVERLAY (Left Side)
+        if (_isAiChatOpen) _buildAiChatPanel(),
+
+        // E. ROOM ID HEADER
         Positioned(
           top: 50,
           left: 20,
@@ -335,7 +332,7 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
           ),
         ),
 
-        // E. BOTTOM CONTROL BAR
+        // F. BOTTOM CONTROL BAR
         Positioned(
           left: 0,
           right: 0,
@@ -378,23 +375,37 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                       await signaling.switchScreenShare(newStatus);
                       setState(() {
                         _isScreenSharing = newStatus;
-                        // Force update local view to show screen or camera
                         _localRenderer.srcObject = signaling.localStream;
                       });
                     },
                   ),
                   const SizedBox(width: 12),
 
-                  // 4. Chat
+                  // 4. Human Chat
                   _buildControlBtn(
                     icon: _isChatOpen ? Icons.chat_bubble : Icons.chat_bubble_outline,
                     color: _isChatOpen ? Colors.blueAccent : Colors.white,
                     bgColor: Colors.transparent,
-                    onPressed: () => setState(() => _isChatOpen = !_isChatOpen),
+                    onPressed: () => setState(() {
+                      _isChatOpen = !_isChatOpen;
+                      if (_isChatOpen) _isAiChatOpen = false; // Close AI chat if human chat opens
+                    }),
                   ),
                   const SizedBox(width: 12),
 
-                  // 5. Hang Up
+                  // 5. NEW: AI Chat Button
+                  _buildControlBtn(
+                    icon: Icons.psychology, // Brain icon
+                    color: _isAiChatOpen ? Colors.purpleAccent : Colors.white,
+                    bgColor: Colors.transparent,
+                    onPressed: () => setState(() {
+                      _isAiChatOpen = !_isAiChatOpen;
+                      if (_isAiChatOpen) _isChatOpen = false; // Close Human chat if AI opens
+                    }),
+                  ),
+                  const SizedBox(width: 12),
+
+                  // 6. Hang Up
                   _buildControlBtn(
                     icon: Icons.call_end,
                     color: Colors.white,
@@ -407,11 +418,11 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
                         _remoteVideoActive = false;
                         _isScreenSharing = false;
                         _isChatOpen = false;
+                        _isAiChatOpen = false;
                         _localRenderer.srcObject = null;
                         _remoteRenderer.srcObject = null;
                       });
 
-                      // Restart Camera for Green Room
                       if (mounted) {
                         await Future.delayed(const Duration(milliseconds: 500));
                         await signaling.openUserMedia(_localRenderer, _remoteRenderer);
@@ -425,6 +436,98 @@ class _VideoCallScreenState extends State<VideoCallScreen> {
           ),
         ),
       ],
+    );
+  }
+
+  // --- 3. HELPER WIDGETS ---
+
+  Widget _buildAiChatPanel() {
+    return Positioned(
+      left: 16, // Left side for AI
+      bottom: 110,
+      top: 60,
+      child: Container(
+        width: 300,
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.9),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.purpleAccent.shade400, width: 1.5),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.purpleAccent.withOpacity(0.3),
+              blurRadius: 20,
+              spreadRadius: 2,
+            )
+          ],
+        ),
+        child: Column(
+          children: [
+            // Header
+            Padding(
+              padding: const EdgeInsets.all(12.0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(Icons.auto_awesome, color: Colors.purpleAccent, size: 20),
+                      SizedBox(width: 8),
+                      Text("AI Assistant", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                    ],
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white),
+                    onPressed: () => setState(() => _isAiChatOpen = false),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1, color: Colors.purpleAccent),
+
+            // Placeholder Body
+            Expanded(
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.psychology, size: 64, color: Colors.grey.shade800),
+                    const SizedBox(height: 16),
+                    const Text(
+                      "AI Chat Coming Soon",
+                      style: TextStyle(color: Colors.grey),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            // Input Placeholder
+            Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade900,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: const Text("Ask AI...", style: TextStyle(color: Colors.grey)),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  const CircleAvatar(
+                    backgroundColor: Colors.purpleAccent,
+                    radius: 20,
+                    child: Icon(Icons.arrow_upward, color: Colors.white, size: 20),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
